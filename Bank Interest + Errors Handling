@@ -1,0 +1,149 @@
+# Bank Interest Calculator, user input visualization. Amount (A), rate (r), time (t) (years), frequency (n) of compounding per year.
+# A = P(1 + r/n)**(nt)
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+# Function to get a positive number from user with error handling
+def get_positive_number(prompt, max_errors=2):
+    error_count = 0
+    while error_count < max_errors:
+        try:
+            value = float(input(prompt))
+            if value <= 0:
+                print("Error: Please enter a positive number > 0).")
+                error_count += 1
+            else:
+                return value
+        except ValueError:
+            print("Error: Please enter a valid number.")
+            error_count += 1
+    
+    # if user made 2 errors, ask for confirmation
+    print(f"You've made {max_errors} invalid attempts. Using your last input anyway...")
+    try:
+        value = float(input(prompt))
+        return abs(value) if value != 0 else 1  # using absolute value or default to 1
+    except ValueError:
+        print("Using default value: 1")
+        return 1
+
+# function to get positive integer with error handling
+def get_positive_integer(prompt, max_errors=2):
+    error_count = 0
+    while error_count < max_errors:
+        try:
+            value = int(input(prompt))
+            if value <= 0:
+                print("Error: Please enter a positive integer >0.")
+                error_count += 1
+            else:
+                return value
+        except ValueError:
+            print("Error: Please enter a valid integer.")
+            error_count += 1
+    
+    # in case if user made 2 errors + asking for confirmation
+    print(f"You've made {max_errors} invalid attempts. Using your last input anyway...")
+    try:
+        value = int(input(prompt))
+        return abs(value) if value != 0 else 1  # using absolute value or default to 1
+    except ValueError:
+        print("Using default value: 1")
+        return 1
+
+# function to get a non-negative number (inflation can be 0)
+def get_non_negative_number(prompt, max_errors=2):
+    error_count = 0
+    while error_count < max_errors:
+        try:
+            value = float(input(prompt))
+            if value < 0:
+                print("Error: Please enter a non-negative number >0.")
+                error_count += 1
+            else:
+                return value
+        except ValueError:
+            print("Error: Please enter a valid number.")
+            error_count += 1
+    
+    # case if user made 2 errors + asking for confirmation
+    print(f"You've made {max_errors} invalid attempts. Using your last input anyway...")
+    try:
+        value = float(input(prompt))
+        return abs(value)  # Use absolute value
+    except ValueError:
+        print("Using default value: 0")
+        return 0
+
+print("This is a Bank Interest Calculator.")
+P = get_positive_number("Enter the principal amount (initial investment): $")
+r = get_non_negative_number("Enter the annual interest rate (as a decimal, e.g., 0.05 for 5%): ")
+t = get_positive_number("Enter the time the money is invested for (in years): ")
+# keep user's chosen n for single-case result
+n_user = get_positive_integer("Enter the number of times that interest is compounded per year (for single-case result): ")
+
+# Compute final amount for the user's chosen frequency using a numerically-stable form
+A_user = P * np.exp(n_user * t * np.log1p(r / n_user))
+print(f"Amount after {t} years with n={n_user} compounding per year: ${A_user:,.2f}")
+
+# comparison frequencies
+freqs = {
+    'Yearly (n=1)': 1,
+    'Monthly (n=12)': 12,
+    'Daily (n=365)': 365,
+    'Minutely (n=525600)': 525600  
+}
+
+# time axis (in years)
+x = np.linspace(0, t, 500)
+
+plt.figure(figsize=(9, 6))
+
+# ask user for expected inflation to show real money
+inflation = get_non_negative_number("Enter expected annual inflation rate (as a decimal, e.g., 0.02 for 2%): ")
+
+# plotting
+for label, n_val in freqs.items():
+    # calculate balance over time
+    y = P * (1 + r / n_val) ** (n_val * x)
+    plt.plot(x, y, label=label)
+
+    # final value at t
+    y_final = P * (1 + r / n_val) ** (n_val * t)
+    plt.plot(t, y_final, 'o', markersize=4)  # mark final point
+    plt.text(t, y_final, f' ${y_final:,.2f}', va='center', ha='left', fontsize=8)
+    # Print final amounts to console
+    print(f"{label}: final amount after {t} years = ${y_final:,.2f}")
+
+# continuous compounding (comparison)
+y_cont = P * np.exp(r * x)
+y_cont_final = P * np.exp(r * t)
+plt.plot(x, y_cont, '--', label='Continuous')
+plt.plot(t, y_cont_final, 'o', markersize=4)
+plt.text(t, y_cont_final, f' ${y_cont_final:,.2f}', va='bottom', ha='left', fontsize=8)
+print(f"Continuous compounding: final amount after {t} years = ${y_cont_final:,.2f}")
+
+# plotting inflation-adjusted (real) balance for the user's chosen frequency as a slightly thicker line
+y_user_nominal = P * (1 + r / n_user) ** (n_user * x)
+real_user = y_user_nominal / np.exp(x * np.log1p(inflation))
+real_user_final = (P * (1 + r / n_user) ** (n_user * t)) / np.exp(t * np.log1p(inflation))
+plt.plot(x, real_user, color='black', linewidth=2, label=f'Real (inflation-adjusted), your n={n_user}')
+plt.plot(t, real_user_final, 's', color='black', markersize=3)
+plt.text(t, real_user_final, f' ${real_user_final:,.2f}', va='center', ha='left', fontsize=8)
+print(f"Inflation-adjusted (real) amount after {t} years with n={n_user}: ${real_user_final:,.2f}")
+
+# title and axis descriptions
+plt.title(f"Account growth of ${P:,.2f} at {r*100:.2f}% over {t} years")
+plt.xlabel("How long the money is invested in years")
+plt.ylabel("Money in US dollars")
+plt.grid(True)  # simple grid on/off
+plt.legend()
+plt.tight_layout()
+
+# show the plot
+plt.show()
+
+#Answer all of the questions A-G using #
+
+# For mortgage, works symmetrically. Do whatever.
