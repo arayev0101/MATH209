@@ -1,0 +1,337 @@
+"""
+Simple backtesting framework for 5 trading strategies on a single stock.
+
+Requirements:
+    pip install pandas numpy yfinance matplotlib
+"""
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import matplotlib.pyplot as plt
+from datetime import datetime
+
+# ============================================================
+# 1. DATA LOADING
+# ============================================================
+
+def load_data_yfinance(ticker="NVDA", start="2015-01-01", end=None):
+    """
+    Load historical OHLCV data for a stock using yfinance.
+    Works for both 'AAPL' and ['AAPL'] inputs.
+    """
+    if end is None:
+        end = datetime.today().strftime("%Y-%m-%d")
+
+    data = yf.download(ticker, start=start, end=end)
+
+    if data.empty:
+        raise ValueError("No data downloaded. Check ticker or date range.")
+
+    # If MultiIndex and ticker is a single string, slice out that ticker
+    if isinstance(data.columns, pd.MultiIndex) and isinstance(ticker, str):
+        # Usually level 1 is the ticker name
+        if ticker in data.columns.get_level_values(1):
+            data = data.xs(ticker, axis=1, level=1)
+
+    data = data.rename(columns=str.strip)
+    return data
+
+
+def load_data_csv(path):
+    """
+    Load historical data from a CSV file.
+    The CSV should contain at least a 'Date' and 'Adj Close' (or 'Close') column.
+    """
+    data = pd.read_csv(path, parse_dates=["Date"], index_col="Date")
+    if "Adj Close" not in data.columns:
+        if "Close" in data.columns:
+            data["Adj Close"] = data["Close"]
+        else:
+            raise ValueError("CSV must contain 'Adj Close' or 'Close' column.")
+    return data
+
+
+# ============================================================
+# 2. HELPER: PRICE & RETURNS
+# ============================================================
+
+def get_price_series(data, preferred_cols=("Adj Close", "Close")):
+    """
+    Extract a 1D price series from a DataFrame that may have:
+    - Single-level columns with 'Adj Close' or 'Close', OR
+    - MultiIndex columns like ('Adj Close', 'AAPL').
+
+    Returns a pandas Series named 'Price'.
+    """
+    cols = data.columns
+
+    # Case 1: MultiIndex columns (e.g. ('Adj Close', 'AAPL'))
+    if isinstance(cols, pd.MultiIndex):
+        level0 = cols.get_level_values(0)
+        for name in preferred_cols:
+            if name in level0:
+                sub = data[name]        # sub-DataFrame with one column per ticker
+                if isinstance(sub, pd.DataFrame):
+                    s = sub.iloc[:, 0]  # take first ticker
+                else:
+                    s = sub
+                s = s.astype(float)
+                s.name = "Price"
+                return s
+
+    # Case 2: Normal single-level columns
+    else:
+        for name in preferred_cols:
+            if name in cols:
+                s = data[name].astype(float)
+                s.name = "Price"
+                return s
+
+    raise KeyError(
+        f"Could not find any of {preferred_cols} in DataFrame columns: {list(cols)}"
+    )
+
+
+def prepare_returns(data):
+    """
+    Add a daily percentage return column based on a unified 'Price' series
+    (taken from Adj Close or Close).
+    """
+    data = data.copy()
+
+    price = get_price_series(data)   # robustly grabs price
+    data["Price"] = price
+    data["Return"] = price.pct_change().fillna(0.0)
+
+    return data
+
+
+def compute_equity_curve(returns, positions, initial_capital=1.0):
+    """
+    Compute equity curve given daily returns and positions.
+    Positions: 1 for fully invested, 0 for cash.
+    We use position from previous day (positions.shift(1)) to avoid look-ahead bias.
+    """
+    positions = positions.fillna(0.0)
+    strategy_returns = positions.shift(1).fillna(0.0) * returns
+    equity = (1 + strategy_returns).cumprod() * initial_capital
+    return equity, strategy_returns
+
+
+def performance_stats(equity_curve, daily_returns):
+    """
+    Compute total return, CAGR, volatility, Sharpe ratio, max drawdown.
+    """
+    total_return = equity_curve.iloc[-1] / equity_curve.iloc[0] - 1
+
+    days = (equity_curve.index[-1] - equity_curve.index[0]).days
+    years = days / 252.0  # approximation
+    if years <= 0:
+        cagr = np.nan
+    else:
+        cagr = (equity_curve.iloc[-1] / equity_curve.iloc[0]) ** (1 / years) - 1
+
+    # Annualized volatility and Sharpe (risk-free rate ~ 0)
+    vol = daily_returns.std() * np.sqrt(252)
+    sharpe = (daily_returns.mean() * 252) / vol if vol != 0 else np.nan
+
+    running_max = equity_curve.cummax()
+    drawdown = equity_curve / running_max - 1.0
+    max_dd = drawdown.min()
+
+    return {
+        "Total Return": total_return,
+        "CAGR": cagr,
+        "Volatility (ann.)": vol,
+        "Sharpe": sharpe,
+        "Max Drawdown": max_dd,
+    }
+
+
+def print_stats(name, stats):
+    """
+    Nicely print performance statistics.
+    """
+    print(f"\n=== {name} ===")
+    for k, v in stats.items():
+        if pd.isna(v):
+            print(f"{k:20s}: NaN")
+        else:
+            # For Sharpe and Volatility, don't format as %
+            if "Volatility" in k or "Sharpe" in k:
+                print(f"{k:20s}: {v: .4f}")
+            else:
+                print(f"{k:20s}: {v: .2%}")
+
+
+# ============================================================
+# 3. STRATEGIES (RETURN POSITIONS SERIES)
+# ============================================================
+
+def strat0_buy_and_hold(data):
+    """
+    Strategy 0: Buy & Hold
+    Always fully invested (position = 1).
+    """
+    pos = pd.Series(1.0, index=data.index, name="Buy & Hold Position")
+    return pos
+
+
+def strat1_sell_big_updays(data, threshold=0.03, reenter_dip=-0.01):
+    """
+    Strategy 1: "Sell if daily change exceeds +3%, buy again on small dips"
+
+    Rules:
+    - If today's return > +3%, go to cash (position 0) for next day.
+    - If in cash and today's return < -1%, re-enter (position 1) next day.
+    - Otherwise keep current position.
+    """
+    returns = data["Return"]
+    pos = pd.Series(0.0, index=data.index, name="Sell big updays Position")
+    in_market = True  # start invested
+
+    for i in range(len(returns)):
+        if i == 0:
+            pos.iloc[i] = float(in_market)
+            continue
+
+        r = returns.iloc[i - 1]  # decision made based on yesterday's return
+        if in_market and r > threshold:
+            in_market = False
+        elif (not in_market) and r < reenter_dip:
+            in_market = True
+
+        pos.iloc[i] = float(in_market)
+
+    return pos
+
+
+def strat2_buy_the_dip(data, dip_threshold=-0.02, hold_days=3):
+    """
+    Strategy 2: Buy-the-dip
+    - If yesterday's return < -2%, buy and hold for 'hold_days' days.
+    - Otherwise, stay in cash.
+    """
+    returns = data["Return"]
+    pos = pd.Series(0.0, index=data.index, name="Buy the dip Position")
+    holding = 0  # days remaining holding
+
+    for i in range(len(returns)):
+        if i == 0:
+            pos.iloc[i] = 0.0
+            continue
+
+        if holding > 0:
+            # Continue holding
+            pos.iloc[i] = 1.0
+            holding -= 1
+        else:
+            pos.iloc[i] = 0.0
+
+        # Check signal from previous day's return
+        r_yesterday = returns.iloc[i - 1]
+        if r_yesterday < dip_threshold and holding == 0:
+            holding = hold_days
+
+    return pos
+
+
+def strat3_moving_average_crossover(data, short_window=20, long_window=50):
+    """
+    Strategy 3: Moving average crossover
+    - Long (1) when short SMA (20d) > long SMA (50d)
+    - Cash (0) otherwise
+    """
+    price = data["Price"]  # use unified price column
+    short_ma = price.rolling(short_window).mean()
+    long_ma = price.rolling(long_window).mean()
+
+    pos = (short_ma > long_ma).astype(float)
+    pos.name = "MA Crossover Position"
+    return pos
+
+
+def strat4_breakout(data, lookback=20):
+    """
+    Strategy 4: Price breakout
+    - Long (1) if today's price > max price over previous 'lookback' days
+    - Cash (0) otherwise
+    """
+    price = data["Price"]
+    rolling_max = price.shift(1).rolling(lookback).max()  # previous lookback high
+    pos = (price > rolling_max).astype(float)
+    pos.name = "Breakout Position"
+    return pos
+
+
+# ============================================================
+# 4. MAIN TESTING AND SELECTION
+# ============================================================
+
+def run_backtest(data):
+    """
+    Run all strategies, compute their equity curves and performance stats,
+    choose the best one (by final equity).
+    """
+    data = prepare_returns(data)
+
+    strategies = {
+        "Buy & Hold": strat0_buy_and_hold(data),
+        "Sell Big Updays": strat1_sell_big_updays(data),
+        "Buy the Dip": strat2_buy_the_dip(data),
+        "MA Crossover": strat3_moving_average_crossover(data),
+        "Breakout": strat4_breakout(data),
+    }
+
+    results = {}
+    best_name = None
+    best_final_equity = -np.inf
+
+    plt.figure(figsize=(12, 6))
+    for name, pos in strategies.items():
+        equity, strat_rets = compute_equity_curve(data["Return"], pos)
+        stats = performance_stats(equity, strat_rets)
+        results[name] = {"equity": equity, "returns": strat_rets, "stats": stats}
+
+        # For comparison plot:
+        plt.plot(equity.index, equity.values, label=name)
+
+        # Track best by final equity
+        if equity.iloc[-1] > best_final_equity:
+            best_final_equity = equity.iloc[-1]
+            best_name = name
+
+    plt.title("Equity Curves of Strategies")
+    plt.xlabel("Date")
+    plt.ylabel("Equity (starting at 1.0)")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+    # Print stats for all strategies
+    print("=== Performance Summary for all strategies ===")
+    for name, res in results.items():
+        print_stats(name, res["stats"])
+
+    # Detailed info on the best strategy
+    print(f"\n\n>>> BEST STRATEGY (by final equity): {best_name}")
+    print_stats(best_name, results[best_name]["stats"])
+
+    return best_name, results
+
+
+# ============================================================
+# 5. SCRIPT ENTRY POINT
+# ============================================================
+
+if __name__ == "__main__":
+    # OPTION A: Load via yfinance (internet required)
+    ticker = "NVDA"
+    data = load_data_yfinance(ticker=ticker, start="2018-01-01")
+
+    # OPTION B: Load from local CSV instead (uncomment and adjust path):
+    # data = load_data_csv("your_data_file.csv")
+
+    print(f"Loaded {len(data)} rows of data for {ticker}.")
+    best_name, results = run_backtest(data)
