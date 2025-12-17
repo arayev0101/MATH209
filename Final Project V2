@@ -1,0 +1,196 @@
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import matplotlib.pyplot as plt
+
+# appying a clean style to plots
+plt.style.use('ggplot')
+
+# 1. DATA & HELPER FUNCTIONS
+
+def load_data(ticker="SPY", start="2018-01-01"):
+    """downloads data and calculates daily returns."""
+    print(f"Downloading {ticker} data...")
+    df = yf.download(ticker, start=start, progress=False)
+    
+    # handling yfinance MultiIndex columns if present
+    if isinstance(df.columns, pd.MultiIndex):
+        df = df.xs(ticker, axis=1, level=1)
+    
+    # 'Adj Close' for accurate returns, fallback to 'Close' in case
+    price_col = "Adj Close" if "Adj Close" in df.columns else "Close"
+    df = df[[price_col]].rename(columns={price_col: "Price"})
+    
+    df["Return"] = df["Price"].pct_change().fillna(0.0)
+    return df
+
+def calculate_equity(returns, position, initial_capital=1000.0, apr=0.0):
+    """
+    calculates the account value over time.
+    if position is 0 (sitting in cash), we earn the Risk-Free Rate (APR) which is short-term (3 months) T-bills' average yield from 2018 - present ~0.0025 (2.5%).
+    """
+    # converting annual apr to daily rate
+    daily_rate = (1 + apr) ** (1/252) - 1 if apr > 0 else 0.0
+    
+    # shifting position by 1 day to prevent looking into the future
+    # (making decisions today based on data and realizing returns tmrow)
+    prev_position = position.shift(1).fillna(0.0)
+    
+    # vectorization logic:
+    # if position is 0 then earn daily cash rate
+    # if position is 1 then earn market return
+    daily_returns = np.where(prev_position == 0, daily_rate, prev_position * returns)
+    
+    # calculating cumulative equity
+    equity_curve = initial_capital * np.cumprod(1 + daily_returns)
+    return pd.Series(equity_curve, index=returns.index)
+
+def get_stats(equity):
+    """returns a dictionary of key performance metrics."""
+    total_ret = (equity.iloc[-1] / equity.iloc[0]) - 1
+    days = (equity.index[-1] - equity.index[0]).days
+    cagr = (equity.iloc[-1] / equity.iloc[0]) ** (365.0 / days) - 1
+    
+    # calculating max drawdown
+    running_max = equity.cummax()
+    drawdown = (equity / running_max) - 1
+    max_dd = drawdown.min()
+    
+    return {
+        "Final Value": f"${equity.iloc[-1]:,.2f}",
+        "Total Return": f"{total_ret:.2%}",
+        "CAGR": f"{cagr:.2%}",
+        "Max Drawdown": f"{max_dd:.2%}"
+    }
+
+# 2. STRATEGIES
+
+def strat_buy_hold(df):
+    return pd.Series(1.0, index=df.index)
+
+def strat_ma_crossover(df, fast=20, slow=50):
+    """longing when Fast MA > Slow MA."""
+    ma_fast = df["Price"].rolling(fast).mean()
+    ma_slow = df["Price"].rolling(slow).mean()
+    return (ma_fast > ma_slow).astype(float)
+
+def strat_sell_big_updays(df, threshold=0.03, reenter=-0.01):
+    """exiting market if daily return > 3%. re-enter if return < -1%."""
+    pos = np.zeros(len(df))
+    in_market = 1.0 # starting long
+    
+    returns = df["Return"].values
+    
+    for i in range(len(df)):
+        # checking yesterday's return to decide today's position
+        if i > 0:
+            if in_market and returns[i-1] > threshold:
+                in_market = 0.0 # selling
+            elif not in_market and returns[i-1] < reenter:
+                in_market = 1.0 # buying back
+        pos[i] = in_market
+        
+    return pd.Series(pos, index=df.index)
+
+def strat_buy_dip(df, dip_thresh=-0.02, hold_days=3):
+    """buying if market drops 2%, holding for 3 days, then exiting."""
+    pos = np.zeros(len(df))
+    days_held = 0
+    returns = df["Return"].values
+
+    for i in range(1, len(df)):
+        if days_held > 0:
+            pos[i] = 1.0
+            days_held -= 1
+        else:
+            # checking if yesterday was a dip
+            if returns[i-1] < dip_thresh:
+                days_held = hold_days
+                pos[i] = 1.0 # entering today
+            else:
+                pos[i] = 0.0
+                
+    return pd.Series(pos, index=df.index)
+
+def strat_rolling_regression(df, warmup=252):
+    """
+    fits a regression line to all available history (Expanding Window).
+    longing if price < lower band (2 Std Devs).
+    cashing out if price > upper band.
+    """
+    prices = df["Price"].values
+    n = len(prices)
+    pos = np.zeros(n)
+    
+    current_pos = 1.0 # starting long
+    pos[:warmup] = 1.0 # holding during warmup
+    
+    # creating an array of day numbers [0, 1, 2...] for regression x-axis
+    days = np.arange(n)
+    
+    for i in range(warmup, n):
+        # fitting the line on history up to today
+        x = days[:i+1]
+        y = prices[:i+1]
+        
+        slope, intercept = np.polyfit(x, y, 1)
+        trend = slope * x[-1] + intercept
+        
+        # calculating standard deviation of residuals
+        std_dev = np.std(y - (slope * x + intercept))
+        
+        upper = trend + (2 * std_dev)
+        lower = trend - (2 * std_dev)
+        price = prices[i]
+        
+        # trading logic
+        if current_pos == 1.0 and price >= upper:
+            current_pos = 0.0 # take Profit
+        elif current_pos == 0.0 and price <= lower:
+            current_pos = 1.0 # buy Dip
+            
+        pos[i] = current_pos
+
+    return pd.Series(pos, index=df.index)
+
+# 3. MAIN EXECUTION
+
+if __name__ == "__main__":
+    # 1. setting up
+    ticker = "SPY"
+    df = load_data(ticker, start="2018-01-01")
+    
+    # 2. defining Strategies
+    strategies = {
+        "Buy & Hold": strat_buy_hold(df),
+        "MA Crossover": strat_ma_crossover(df),
+        "Sell Big Updays": strat_sell_big_updays(df),
+        "Buy the Dip": strat_buy_dip(df),
+        "Rolling Regression": strat_rolling_regression(df)
+    }
+
+    # 3. backtest loop
+    results = {}
+    
+    print(f"\n{'STRATEGY':<25} | {'FINAL VALUE':<12} | {'CAGR':<8} | {'MAX DD':<8}")
+    print("-" * 65)
+
+    for name, positions in strategies.items():
+        # applying special APR only for Rolling Regression
+        apr = 0.025 if name == "Rolling Regression" else 0.0
+        
+        equity = calculate_equity(df["Return"], positions, apr=apr)
+        stats = get_stats(equity)
+        
+        results[name] = equity
+        print(f"{name:<25} | {stats['Final Value']:<12} | {stats['CAGR']:<8} | {stats['Max Drawdown']:<8}")
+
+    # 4. visualization
+    plt.figure(figsize=(12, 6))
+    for name, equity in results.items():
+        plt.plot(equity, label=name, linewidth=1.5)
+    
+    plt.title(f"Strategy Performance Comparison ({ticker})")
+    plt.ylabel("Account Balance ($)")
+    plt.legend()
+    plt.show()
